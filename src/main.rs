@@ -3,11 +3,19 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, exit};
 
-fn real_cargo() -> PathBuf {
-    PathBuf::from(env::var("USERPROFILE").expect("USERPROFILE is not defined"))
-        .join(".cargo")
-        .join("bin")
-        .join("cargo.exe")
+fn real_cargo() -> Option<PathBuf> {
+    // Rustup honours CARGO_HOME, so that is where the real cargo lives when it is set.
+    if let Some(cargo_home) = env::var_os("CARGO_HOME") {
+        return Some(PathBuf::from(cargo_home).join("bin").join("cargo.exe"));
+    }
+
+    // Otherwise, the real cargo may be in the user's profile directory.
+    env::var_os("USERPROFILE").map(|user_profile| {
+        PathBuf::from(user_profile)
+            .join(".cargo")
+            .join("bin")
+            .join("cargo.exe")
+    })
 }
 
 fn install_wrapper() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,9 +49,8 @@ fn install_wrapper() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let build_status = Command::new(real_cargo())
-        .args(["build", "--release"])
-        .status()?;
+    let cargo = real_cargo().ok_or("neither CARGO_HOME nor USERPROFILE is defined")?;
+    let build_status = Command::new(cargo).args(["build", "--release"]).status()?;
     if !build_status.success() {
         return Err("release build failed".into());
     }
@@ -84,7 +91,14 @@ if (-not ($entries | Where-Object { $_.TrimEnd('\\') -ieq $bin.TrimEnd('\\') }))
 fn main() {
     let mut args: Vec<String> = env::args().skip(1).collect();
 
-    if let Some(command) = args.first_mut() {
+    // A leading +toolchain is consumed by rustup, so the subcommand is the argument after it.
+    let sub = if args.first().is_some_and(|arg| arg.starts_with('+')) {
+        1
+    } else {
+        0
+    };
+
+    if let Some(command) = args.get_mut(sub) {
         match command.as_str() {
             "wrapper" => {
                 println!("Cargo wrapper is active.");
@@ -109,33 +123,57 @@ fn main() {
     }
 
     let locked_commands = [
-        "build", "test", "run", "check", "bench", "clippy", "doc", "rustc", "rustdoc",
+        "build", "test", "run", "check", "bench", "clippy", "doc", "rustc", "rustdoc", "install",
     ];
 
-    if let Some(command) = args.first() {
-        if locked_commands.contains(&command.as_str()) && !args.iter().any(|arg| arg == "--locked")
-        {
-            args.insert(1, "--locked".to_string());
+    // Arguments after a bare -- belong to the program cargo launches.
+    let cargo_args_end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let already_locked = args[..cargo_args_end].iter().any(|arg| arg == "--locked");
+
+    let needs_locked = args
+        .get(sub)
+        .is_some_and(|command| locked_commands.contains(&command.as_str()));
+
+    if needs_locked && !already_locked {
+        args.insert(sub + 1, "--locked".to_string());
+
+        if env::var_os("CARGO_WRAPPER_VERBOSE").is_some() {
+            eprintln!("cargo-wrapper: added --locked");
         }
     }
 
-    let cargo = real_cargo();
+    let Some(cargo) = real_cargo() else {
+        eprintln!("cargo-wrapper: neither CARGO_HOME nor USERPROFILE is defined");
+        exit(1);
+    };
 
     if let Ok(log_file_path) = env::var("CARGO_WRAPPER_LOG_FILE") {
         use std::fs::OpenOptions;
 
-        let mut log_file = OpenOptions::new()
+        match OpenOptions::new()
             .create(true)
             .append(true)
-            .open(log_file_path)
-            .unwrap();
-        writeln!(log_file, "Executing: cargo {}", args.join(" ")).unwrap();
+            .open(&log_file_path)
+        {
+            Ok(mut log_file) => {
+                writeln!(log_file, "Executing: cargo {}", args.join(" ")).unwrap();
+            }
+            Err(error) => {
+                eprintln!("cargo-wrapper: cannot write {log_file_path}: {error}");
+            }
+        }
     }
 
-    let status = Command::new(cargo)
+    let status = Command::new(&cargo)
         .args(&args)
         .status()
-        .expect("failed to execute cargo");
+        .unwrap_or_else(|error| {
+            eprintln!("cargo-wrapper: cannot run {}: {error}", cargo.display());
+            exit(1);
+        });
 
     exit(status.code().unwrap_or(1));
 }
