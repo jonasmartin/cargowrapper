@@ -136,7 +136,7 @@ Cargo wrapper is active.
 
 ## Command logging
 
-Logging is disabled by default. Set `CARGO_WRAPPER_LOG_FILE` to enable it and specify the destination file:
+Logging is disabled by default. Set `CARGO_WRAPPER_LOG_FILE` to enable it and specify the destination file. This environment variable takes precedence over file configuration:
 
 ```sh
 # macOS
@@ -150,10 +150,16 @@ $env:CARGO_WRAPPER_LOG_FILE = "C:\logs\cargo-wrapper.log"
 cargo check
 ```
 
-Each forwarded command is appended to the file:
+If `CARGO_WRAPPER_LOG_FILE` is not set, the wrapper looks for `wrapper.toml` in the same directory as the wrapper executable. Set `LOG_FILE` using either an unquoted or quoted value:
+
+```toml
+LOG_FILE=logs/cargo-wrapper.log
+```
+
+Relative paths are resolved from the wrapper executable's directory. Absolute paths can also be used. Each forwarded command is appended to the selected file with an RFC 3339 UTC timestamp:
 
 ```text
-Executing: cargo check --locked
+2026-08-27T16:42:15.123456Z Executing: cargo check --locked
 ```
 
 The destination directory must already exist.

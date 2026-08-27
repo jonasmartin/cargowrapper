@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, exit};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn executable_name(name: &str) -> String {
     format!("{name}{}", env::consts::EXE_SUFFIX)
@@ -25,6 +26,82 @@ fn real_cargo() -> Option<PathBuf> {
         .or_else(|| home_dir().map(|home| home.join(".cargo")))?;
 
     Some(cargo_home.join("bin").join(executable_name("cargo")))
+}
+
+fn parse_config_log_file(contents: &str) -> Option<PathBuf> {
+    contents.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+
+        let (key, value) = line.split_once('=')?;
+        if key.trim() != "LOG_FILE" {
+            return None;
+        }
+
+        let value = value.trim();
+        let value = if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            &value[1..value.len() - 1]
+        } else {
+            value
+        };
+
+        (!value.is_empty()).then(|| PathBuf::from(value))
+    })
+}
+
+fn configured_log_file() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("CARGO_WRAPPER_LOG_FILE") {
+        return Some(PathBuf::from(path));
+    }
+
+    let executable_dir = env::current_exe().ok()?.parent()?.to_path_buf();
+    let contents = std::fs::read_to_string(executable_dir.join("wrapper.toml")).ok()?;
+    let path = parse_config_log_file(&contents)?;
+
+    Some(if path.is_absolute() {
+        path
+    } else {
+        executable_dir.join(path)
+    })
+}
+
+fn format_utc_timestamp(seconds: u64, milliseconds: u32) -> String {
+    let days = (seconds / 86_400) as i64;
+    let seconds_in_day = seconds % 86_400;
+    let hour = seconds_in_day / 3_600;
+    let minute = (seconds_in_day % 3_600) / 60;
+    let second = seconds_in_day % 60;
+
+    // Convert days since the Unix epoch to a Gregorian calendar date.
+    let shifted_days = days + 719_468;
+    let era = if shifted_days >= 0 {
+        shifted_days
+    } else {
+        shifted_days - 146_096
+    } / 146_097;
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_part = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{milliseconds:03}Z")
+}
+
+fn utc_timestamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format_utc_timestamp(now.as_secs(), now.subsec_millis())
 }
 
 #[cfg(unix)]
@@ -237,7 +314,7 @@ fn main() {
         exit(1);
     };
 
-    if let Ok(log_file_path) = env::var("CARGO_WRAPPER_LOG_FILE") {
+    if let Some(log_file_path) = configured_log_file() {
         use std::fs::OpenOptions;
 
         match OpenOptions::new()
@@ -246,10 +323,14 @@ fn main() {
             .open(&log_file_path)
         {
             Ok(mut log_file) => {
-                writeln!(log_file, "Executing: cargo {}", args.join(" ")).unwrap();
+                let timestamp = utc_timestamp();
+                writeln!(log_file, "{timestamp} Executing: cargo {}", args.join(" ")).unwrap();
             }
             Err(error) => {
-                eprintln!("cargo-wrapper: cannot write {log_file_path}: {error}");
+                eprintln!(
+                    "cargo-wrapper: cannot write {}: {error}",
+                    log_file_path.display()
+                );
             }
         }
     }
@@ -268,12 +349,33 @@ fn main() {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn unix_executable_names_have_no_suffix() {
         assert_eq!(executable_name("cargo"), "cargo");
         assert_eq!(executable_name("cargowrapper"), "cargowrapper");
+    }
+
+    #[test]
+    fn parses_plain_and_quoted_log_file_settings() {
+        assert_eq!(
+            parse_config_log_file("OTHER=value\nLOG_FILE=commands.log\n"),
+            Some(PathBuf::from("commands.log"))
+        );
+        assert_eq!(
+            parse_config_log_file("LOG_FILE = \"logs/commands.log\""),
+            Some(PathBuf::from("logs/commands.log"))
+        );
+        assert_eq!(parse_config_log_file("# LOG_FILE=ignored.log"), None);
+    }
+
+    #[test]
+    fn formats_utc_timestamps_without_external_dependencies() {
+        assert_eq!(format_utc_timestamp(0, 0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            format_utc_timestamp(1_735_689_599, 123),
+            "2024-12-31T23:59:59.123Z"
+        );
     }
 
     #[test]
