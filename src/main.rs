@@ -1,21 +1,66 @@
 use std::env;
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, exit};
 
+fn executable_name(name: &str) -> String {
+    format!("{name}{}", env::consts::EXE_SUFFIX)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let home = env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let home = env::var_os("HOME");
+
+    home.map(PathBuf::from)
+}
+
 fn real_cargo() -> Option<PathBuf> {
     // Rustup honours CARGO_HOME, so that is where the real cargo lives when it is set.
-    if let Some(cargo_home) = env::var_os("CARGO_HOME") {
-        return Some(PathBuf::from(cargo_home).join("bin").join("cargo.exe"));
+    let cargo_home = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".cargo")))?;
+
+    Some(cargo_home.join("bin").join(executable_name("cargo")))
+}
+
+#[cfg(unix)]
+fn shell_profile(home: &Path) -> PathBuf {
+    let shell = env::var_os("SHELL")
+        .and_then(|shell| PathBuf::from(shell).file_name().map(|name| name.to_owned()));
+
+    match shell.as_deref().and_then(|name| name.to_str()) {
+        Some("zsh") => home.join(".zprofile"),
+        Some("bash") => home.join(".bash_profile"),
+        _ => home.join(".profile"),
+    }
+}
+
+#[cfg(unix)]
+fn ensure_unix_path(profile: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs::OpenOptions;
+
+    const PATH_LINE: &str = r#"export PATH="$HOME/.local/bin:$PATH""#;
+    let existing = match std::fs::read_to_string(profile) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+
+    if existing.lines().any(|line| line.trim() == PATH_LINE) {
+        return Ok(());
     }
 
-    // Otherwise, the real cargo may be in the user's profile directory.
-    env::var_os("USERPROFILE").map(|user_profile| {
-        PathBuf::from(user_profile)
-            .join(".cargo")
-            .join("bin")
-            .join("cargo.exe")
-    })
+    let mut file = OpenOptions::new().create(true).append(true).open(profile)?;
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        writeln!(file)?;
+    }
+    writeln!(file, "# Added by cargo-wrapper")?;
+    writeln!(file, "{PATH_LINE}")?;
+    Ok(())
 }
 
 fn install_wrapper() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,9 +68,15 @@ fn install_wrapper() -> Result<(), Box<dyn std::error::Error>> {
     let release_executable = project_dir
         .join("target")
         .join("release")
-        .join("cargowrapper.exe");
-    let bin_dir = PathBuf::from(env::var("USERPROFILE")?).join("bin");
-    let installed_executable = bin_dir.join("cargo.exe");
+        .join(executable_name("cargowrapper"));
+    let home = home_dir().ok_or("cannot determine the user's home directory")?;
+    #[cfg(windows)]
+    let bin_dir = home.join("bin");
+    #[cfg(unix)]
+    let bin_dir = home.join(".local").join("bin");
+    let installed_executable = bin_dir.join(executable_name("cargo"));
+    #[cfg(unix)]
+    let profile = shell_profile(&home);
 
     println!("The installer will:");
     println!("  [ ] Build the wrapper in release mode.");
@@ -35,7 +86,14 @@ fn install_wrapper() -> Result<(), Box<dyn std::error::Error>> {
         release_executable.display(),
         installed_executable.display()
     );
+    #[cfg(windows)]
     println!("  [ ] Add {} to your user PATH.", bin_dir.display());
+    #[cfg(unix)]
+    println!(
+        "  [ ] Add {} to PATH in {}.",
+        bin_dir.display(),
+        profile.display()
+    );
     print!("Continue? [Y/n] ");
     io::stdout().flush()?;
 
@@ -49,7 +107,8 @@ fn install_wrapper() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let cargo = real_cargo().ok_or("neither CARGO_HOME nor USERPROFILE is defined")?;
+    let cargo = real_cargo()
+        .ok_or("cannot locate Cargo: neither CARGO_HOME nor the home directory is defined")?;
     let build_status = Command::new(cargo).args(["build", "--release"]).status()?;
     if !build_status.success() {
         return Err("release build failed".into());
@@ -60,12 +119,21 @@ fn install_wrapper() -> Result<(), Box<dyn std::error::Error>> {
     println!("  [x] Ensured {} exists.", bin_dir.display());
 
     std::fs::copy(&release_executable, &installed_executable)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&installed_executable)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&installed_executable, permissions)?;
+    }
     println!(
         "  [x] Copied the wrapper to {}.",
         installed_executable.display()
     );
 
-    let path_script = r#"
+    #[cfg(windows)]
+    {
+        let path_script = r#"
 $bin = $env:CARGO_WRAPPER_INSTALL_DIR
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 $entries = @($userPath -split ';' | Where-Object { $_ })
@@ -74,17 +142,34 @@ if (-not ($entries | Where-Object { $_.TrimEnd('\\') -ieq $bin.TrimEnd('\\') }))
     [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
 }
 "#;
-    let path_status = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", path_script])
-        .env("CARGO_WRAPPER_INSTALL_DIR", &bin_dir)
-        .status()?;
-    if !path_status.success() {
-        return Err("failed to update the user PATH".into());
+        let path_status = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", path_script])
+            .env("CARGO_WRAPPER_INSTALL_DIR", &bin_dir)
+            .status()?;
+        if !path_status.success() {
+            return Err("failed to update the user PATH".into());
+        }
+        println!("  [x] Ensured {} is in your user PATH.", bin_dir.display());
     }
-    println!("  [x] Ensured {} is in your user PATH.", bin_dir.display());
+
+    #[cfg(unix)]
+    {
+        ensure_unix_path(&profile)?;
+        println!(
+            "  [x] Ensured {} is in PATH via {}.",
+            bin_dir.display(),
+            profile.display()
+        );
+    }
 
     println!("Installed {}.", installed_executable.display());
+    #[cfg(windows)]
     println!("Open a new terminal and run `cargo wrapper` to verify it.");
+    #[cfg(unix)]
+    println!(
+        "Open a new terminal or run `source {}`, then run `cargo wrapper` to verify it.",
+        profile.display()
+    );
     Ok(())
 }
 
@@ -146,7 +231,9 @@ fn main() {
     }
 
     let Some(cargo) = real_cargo() else {
-        eprintln!("cargo-wrapper: neither CARGO_HOME nor USERPROFILE is defined");
+        eprintln!(
+            "cargo-wrapper: cannot locate Cargo: neither CARGO_HOME nor the home directory is defined"
+        );
         exit(1);
     };
 
@@ -176,4 +263,35 @@ fn main() {
         });
 
     exit(status.code().unwrap_or(1));
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn unix_executable_names_have_no_suffix() {
+        assert_eq!(executable_name("cargo"), "cargo");
+        assert_eq!(executable_name("cargowrapper"), "cargowrapper");
+    }
+
+    #[test]
+    fn adding_the_path_to_a_profile_is_idempotent() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile = env::temp_dir().join(format!(
+            "cargo-wrapper-profile-{}-{unique}",
+            std::process::id()
+        ));
+
+        ensure_unix_path(&profile).unwrap();
+        ensure_unix_path(&profile).unwrap();
+        let contents = std::fs::read_to_string(&profile).unwrap();
+        std::fs::remove_file(profile).unwrap();
+
+        assert_eq!(contents.matches("$HOME/.local/bin").count(), 1);
+    }
 }

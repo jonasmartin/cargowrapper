@@ -1,12 +1,11 @@
 # Cargo Wrapper
 
-A small Windows wrapper for Cargo that enforces locked dependency resolution for common commands and prevents accidental lockfile updates.
+A small macOS and Windows wrapper for Cargo that enforces locked dependency resolution for common commands and prevents accidental lockfile updates.
 
-The wrapper forwards commands to the real Cargo executable at:
+The wrapper forwards commands to the real Cargo executable in `$CARGO_HOME/bin`, or to the standard Rustup installation when `CARGO_HOME` is unset:
 
-```text
-%USERPROFILE%\.cargo\bin\cargo.exe
-```
+- macOS: `$HOME/.cargo/bin/cargo`
+- Windows: `%USERPROFILE%\.cargo\bin\cargo.exe`
 
 ## Behavior
 
@@ -32,35 +31,59 @@ All other commands and arguments are passed through unchanged.
 
 From the project directory, run:
 
-```powershell
+```sh
 cargo run -- wrapper-install
 ```
 
-The command first displays every action with an unchecked box and asks `Continue? [Y/n]`. Press Enter or enter `Y` to run the steps; each completed action is then printed with `[x]`:
+The command displays its planned actions and asks `Continue? [Y/n]`. Press Enter or enter `Y` to:
 
 1. Build the release executable.
-2. Create `%USERPROFILE%\bin`.
-3. Copy the release executable to `%USERPROFILE%\bin\cargo.exe`.
-4. Prepend `%USERPROFILE%\bin` to your persistent user `PATH` if it is not already present.
+2. Create the wrapper bin directory.
+3. Copy and rename the release executable to `cargo` (or `cargo.exe`).
+4. Prepend the wrapper bin directory to your persistent `PATH`.
 
-Enter `n` to cancel without making these installation changes. After installation, open a new terminal and verify it:
+On macOS, the wrapper is installed as `$HOME/.local/bin/cargo`. The installer updates `.zprofile` for zsh, `.bash_profile` for bash, or `.profile` for other shells. Open a new terminal, or source the profile printed by the installer, and verify:
+
+```sh
+which cargo
+cargo wrapper
+```
+
+`which cargo` should report `$HOME/.local/bin/cargo`.
+
+On Windows, the wrapper is installed as `%USERPROFILE%\bin\cargo.exe`. Open a new terminal and verify with:
 
 ```powershell
 Get-Command cargo
 cargo wrapper
 ```
 
-`Get-Command cargo` should report `%USERPROFILE%\bin\cargo.exe`, and the second command should print `Cargo wrapper is active.`
+Enter `n` at the prompt to cancel without making installation changes.
 
 ## Manual installation
 
-### 1. Build the executable
+### macOS
+
+```sh
+cargo build --release
+mkdir -p "$HOME/.local/bin"
+cp target/release/cargowrapper "$HOME/.local/bin/cargo"
+chmod 755 "$HOME/.local/bin/cargo"
+printf '\n# Added by cargo-wrapper\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.zprofile"
+source "$HOME/.zprofile"
+```
+
+Do not install the wrapper in `$HOME/.cargo/bin`; it needs the real Cargo executable there for forwarding. Verify with `which cargo` and `cargo wrapper`.
+
+### Windows
+
+#### 1. Build the executable
 
 ```powershell
 cargo build --release
 ```
 
-### 2. Install it in a separate directory
+#### 2. Install it in a separate directory
 
 Create a directory for wrapper executables, then copy and rename the compiled executable to `cargo.exe`:
 
@@ -71,7 +94,7 @@ Copy-Item target\release\cargowrapper.exe C:\bin\cargo.exe
 
 Do not place the wrapper in `%USERPROFILE%\.cargo\bin` or replace the real Cargo executable there. The wrapper needs that executable to forward commands.
 
-### 3. Add the directory to `PATH`
+#### 3. Add the directory to `PATH`
 
 Prepend `C:\bin` to your persistent user `PATH` with PowerShell:
 
@@ -91,7 +114,7 @@ Alternatively, use **System Properties → Environment Variables**, edit the use
 
 The order is important: Windows must find `C:\bin\cargo.exe` before the real Cargo executable.
 
-### 4. Verify the installation
+#### 4. Verify the installation
 
 Check which executable Windows finds:
 
@@ -115,7 +138,14 @@ Cargo wrapper is active.
 
 Logging is disabled by default. Set `CARGO_WRAPPER_LOG_FILE` to enable it and specify the destination file:
 
+```sh
+# macOS
+export CARGO_WRAPPER_LOG_FILE="$HOME/cargo-wrapper.log"
+cargo check
+```
+
 ```powershell
+# Windows
 $env:CARGO_WRAPPER_LOG_FILE = "C:\logs\cargo-wrapper.log"
 cargo check
 ```
