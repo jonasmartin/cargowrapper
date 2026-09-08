@@ -1,8 +1,8 @@
+mod plugins;
+
 use std::env;
 use std::io::{self, Write};
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -250,8 +250,49 @@ if (-not ($entries | Where-Object { $_.TrimEnd('\\') -ieq $bin.TrimEnd('\\') }))
     Ok(())
 }
 
+fn run_real_cargo(cargo: &Path, args: &[String]) -> Result<i32, String> {
+    if let Some(log_file_path) = configured_log_file() {
+        use std::fs::OpenOptions;
+
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file_path)
+        {
+            Ok(mut log_file) => {
+                let timestamp = utc_timestamp();
+                writeln!(log_file, "{timestamp} Executing: cargo {}", args.join(" ")).unwrap();
+            }
+            Err(error) => {
+                eprintln!(
+                    "cargo-wrapper: cannot write {}: {error}",
+                    log_file_path.display()
+                );
+            }
+        }
+    }
+
+    let mut command = Command::new(cargo);
+    command.args(args);
+    plugins::clear_protocol_environment(&mut command);
+    let status = command
+        .status()
+        .map_err(|error| format!("cargo-wrapper: cannot run {}: {error}", cargo.display()))?;
+
+    Ok(status.code().unwrap_or(1))
+}
+
 fn main() {
     let mut args: Vec<String> = env::args().skip(1).collect();
+
+    match plugins::continue_if_requested(&args, run_real_cargo) {
+        Ok(Some(code)) => exit(code),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            exit(1);
+        }
+    }
 
     // A leading +toolchain is consumed by rustup, so the subcommand is the argument after it.
     let sub = if args.first().is_some_and(|arg| arg.starts_with('+')) {
@@ -259,6 +300,19 @@ fn main() {
     } else {
         0
     };
+    let original_subcommand = args.get(sub).cloned();
+
+    if args.get(sub).is_some_and(|command| command == "wrapper")
+        && args.get(sub + 1).is_some_and(|command| command == "plugin")
+    {
+        match plugins::manage(&args[sub + 2..]) {
+            Ok(code) => exit(code),
+            Err(error) => {
+                eprintln!("{error}");
+                exit(1);
+            }
+        }
+    }
 
     if let Some(command) = args.get_mut(sub) {
         match command.as_str() {
@@ -294,14 +348,12 @@ fn main() {
         .position(|arg| arg == "--")
         .unwrap_or(args.len());
     let already_locked = args[..cargo_args_end].iter().any(|arg| arg == "--locked");
-
     let needs_locked = args
         .get(sub)
         .is_some_and(|command| locked_commands.contains(&command.as_str()));
 
     if needs_locked && !already_locked {
         args.insert(sub + 1, "--locked".to_string());
-
         if env::var_os("CARGO_WRAPPER_VERBOSE").is_some() {
             eprintln!("cargo-wrapper: added --locked");
         }
@@ -313,37 +365,17 @@ fn main() {
         );
         exit(1);
     };
-
-    if let Some(log_file_path) = configured_log_file() {
-        use std::fs::OpenOptions;
-
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file_path)
-        {
-            Ok(mut log_file) => {
-                let timestamp = utc_timestamp();
-                writeln!(log_file, "{timestamp} Executing: cargo {}", args.join(" ")).unwrap();
-            }
-            Err(error) => {
-                eprintln!(
-                    "cargo-wrapper: cannot write {}: {error}",
-                    log_file_path.display()
-                );
-            }
-        }
-    }
-
-    let status = Command::new(&cargo)
-        .args(&args)
-        .status()
-        .unwrap_or_else(|error| {
-            eprintln!("cargo-wrapper: cannot run {}: {error}", cargo.display());
-            exit(1);
-        });
-
-    exit(status.code().unwrap_or(1));
+    let code = plugins::dispatch(
+        &cargo,
+        original_subcommand.as_deref(),
+        &args,
+        run_real_cargo,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("{error}");
+        1
+    });
+    exit(code);
 }
 
 #[cfg(all(test, unix))]
